@@ -4,9 +4,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 class Analyzer:
-    def __init__(self, file_path, sep=';', encoding='utf-8'):
-        self.df = pd.read_csv(file_path, sep=sep, encoding=encoding)
-        print(f"Loaded dataset with {self.df.shape[0]} rows and {self.df.shape[1]} columns.")
+    def __init__(self, data, sep=';', encoding='utf-8'):
+        """
+        data: can be a string (file path) or a pandas DataFrame.
+        """
+        if isinstance(data, str):
+            try:
+                self.df = pd.read_csv(data, sep=sep, encoding=encoding)
+            except UnicodeDecodeError:
+                self.df = pd.read_csv(data, sep=sep, encoding='latin-1')
+        elif isinstance(data, pd.DataFrame):
+            self.df = data.copy()
+        else:
+            raise ValueError("Data must be a file path (str) or a pandas DataFrame.")
+            
+        print(f"Dataset ready: {self.df.shape[0]} rows and {self.df.shape[1]} columns.")
 
     def get_inventory(self):
         """
@@ -39,20 +51,34 @@ class Analyzer:
         inventory_df = pd.DataFrame(inventory)
         return inventory_df
 
-    def plot_distributions(self, cols=None):
-        """Plots histograms for numerical or countplots for categorical columns."""
-        target_cols = cols if cols else self.df.columns[:6] # Limit to 6 by default
+    def plot_distributions(self, cols=None, cols_per_row=2):
+        target_cols = cols if cols else self.df.columns
+        n_cols = len(target_cols)
+        n_rows = (n_cols + cols_per_row - 1) // cols_per_row
         
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(16, 4 * n_rows)) 
+
         for i, col in enumerate(target_cols, 1):
-            plt.subplot(int(len(target_cols)/2) + 1, 2, i)
-            if np.issubdtype(self.df[col].dtype, np.number):
+            ax = plt.subplot(n_rows, cols_per_row, i)
+            
+            # 1. Handle One-Hot Encoded / Boolean / Low Cardinality
+            if self.df[col].dtype == 'bool' or self.df[col].nunique() == 2:
+                # FIX: Assign x to hue and set legend=False
+                sns.countplot(x=self.df[col], hue=self.df[col], palette="Blues_r", legend=False)
+                plt.title(f"Flag: {col}")
+            
+            # 2. Handle Continuous Numeric data
+            elif np.issubdtype(self.df[col].dtype, np.number):
                 sns.histplot(self.df[col], kde=True, color="teal")
+                plt.title(f"Numeric: {col}")
+            
+            # 3. Handle Categorical data
             else:
-                # Top 10 most frequent categories to avoid clutter
-                sns.countplot(y=self.df[col], order=self.df[col].value_counts().iloc[:10].index)
-            plt.title(f"Distribution: {col}")
-        
+                counts = self.df[col].value_counts().iloc[:10]
+                # FIX: Assign y to hue and set legend=False
+                sns.barplot(y=counts.index, x=counts.values, hue=counts.index, palette="viridis", legend=False)
+                plt.title(f"Categorical: {col}")
+
         plt.tight_layout()
         plt.show()
 
@@ -71,10 +97,46 @@ class Analyzer:
         correlations = correlations.drop(target_column)
 
         plt.figure(figsize=(10, 6))
-        sns.barplot(x=correlations.values, y=correlations.index, palette="RdBu_r")
+        sns.barplot(x=correlations.values, y=correlations.index, hue=correlations.index, palette="RdBu_r", legend=False)
         plt.axvline(x=0, color='black', linestyle='--', linewidth=1)
         plt.title(f"Correlation of Features with '{target_column}'")
         plt.xlabel("Pearson Correlation Coefficient")
         plt.show()
 
         return correlations
+
+class DataPreprocessor:
+    def __init__(self, df):
+        # We work on a copy to keep the original data intact
+        self.df = df.copy()
+        self.original_columns = df.columns.tolist()
+
+    def handle_encoding(self):
+            """
+            Automatically identifies 'object' columns, applies One-Hot Encoding,
+            and sanitizes column names to prevent SyntaxErrors.
+            """
+            # Identify columns to encode
+            categorical_cols = self.df.select_dtypes(include=['object']).columns.tolist()
+            
+            if not categorical_cols:
+                print("No categorical columns (type 'object') found to encode.")
+                return self.df
+
+            print(f"Encoding columns: {categorical_cols}")
+
+            # Perform One-Hot Encoding
+            self.df = pd.get_dummies(self.df, columns=categorical_cols, drop_first=False)
+            
+            # Column Name Sanitization
+            self.df.columns = [
+                col.replace("'", "")
+                .replace(" ", "_")
+                .replace("/", "_")
+                .replace("(", "")
+                .replace(")", "") 
+                for col in self.df.columns
+            ]
+            
+            print(f"Encoding complete. New shape: {self.df.shape}")
+            return self.df
