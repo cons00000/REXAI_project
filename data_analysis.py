@@ -104,6 +104,18 @@ class Analyzer:
         plt.show()
 
         return correlations
+    
+    def plot_matrix_correlation(self):
+        """
+        Plots a correlation matrix for all numeric features.
+        """
+        numeric_df = self.df.select_dtypes(include=[np.number])
+        corr_matrix = numeric_df.corr()
+
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", center=0)
+        plt.title("Correlation Matrix of Numeric Features")
+        plt.show()
 
 class DataPreprocessor:
     def __init__(self, df):
