@@ -91,7 +91,14 @@ class Analyzer:
             return
 
         # Calculate correlations
-        correlations = self.df.select_dtypes(include=[np.number]).corr()[target_column].sort_values(ascending=False)
+        bool_cols = self.df.select_dtypes(include=[bool]).columns
+        numeric_df = self.df.select_dtypes(include=[np.number]).copy()
+
+        for col in bool_cols:
+            if col not in numeric_df.columns:
+                numeric_df[col] = self.df[col].astype(int)
+
+        correlations = numeric_df.corr()[target_column].sort_values(ascending=False)
         
         # Remove the target's correlation with itself
         correlations = correlations.drop(target_column)
@@ -105,16 +112,31 @@ class Analyzer:
 
         return correlations
     
-    def plot_matrix_correlation(self):
+    def plot_matrix_correlation(self, threshold: float = 0.3):
         """
-        Plots a correlation matrix for all numeric features.
+        Plots a correlation matrix for all numeric and boolean features,
+        filtering out variables with no correlation above the given threshold.
         """
-        numeric_df = self.df.select_dtypes(include=[np.number])
+        bool_cols = self.df.select_dtypes(include=[bool]).columns
+        numeric_df = self.df.select_dtypes(include=[np.number]).copy()
+
+        for col in bool_cols:
+            if col not in numeric_df.columns:
+                numeric_df[col] = self.df[col].astype(int)
+
         corr_matrix = numeric_df.corr()
 
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", center=0)
-        plt.title("Correlation Matrix of Numeric Features")
+        # Garder uniquement les variables ayant au moins une corrélation > seuil (hors diagonale)
+        mask = (corr_matrix.abs() >= threshold)
+        np.fill_diagonal(mask.values, False)
+        cols_to_keep = mask.any(axis=1)
+        corr_filtered = corr_matrix.loc[cols_to_keep, cols_to_keep]
+
+        size = max(10, len(corr_filtered) * 0.6)
+        plt.figure(figsize=(size, size * 0.85))
+        sns.heatmap(corr_filtered, annot=True, fmt=".2f", cmap="coolwarm", center=0)
+        plt.title(f"Correlation Matrix (|r| ≥ {threshold})")
+        plt.tight_layout()
         plt.show()
 
 class DataPreprocessor:
