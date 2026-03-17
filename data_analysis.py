@@ -176,3 +176,82 @@ class DataPreprocessor:
             
             print(f"Encoding complete. New shape: {self.df.shape}")
             return self.df
+
+def get_parcours(df, matricule):
+    """
+    Filtre et prépare les données pour un matricule.
+    """
+    data = df[df['matricule'] == matricule].copy()
+    
+    print(f"Nombre de lignes pour le matricule {matricule} :", len(data))
+    
+    if data.empty:
+        return data
+    
+    # Conversion des colonnes utiles
+    data['Début'] = pd.to_numeric(data['Début de contrat (années)'], errors='coerce')
+    data['Ancienneté'] = pd.to_numeric(data['Ancienneté groupe (années)'], errors='coerce')
+    data['Niveau hiérarchique'] = pd.to_numeric(data['Niveau hiérarchique'], errors='coerce')
+    
+    # Reconstruction du temps
+    data['temps'] = data['Début'] + data['Ancienneté']
+    
+    # Trier
+    parcours = data.sort_values('temps')
+    
+    return parcours
+
+def plot_parcours(parcours, title="Parcours pro"):
+    if parcours.empty:
+        print("Aucune donnée à afficher.")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    # Ligne principale
+    ax.plot(parcours['temps'], parcours['Niveau hiérarchique'], marker='o')
+    
+    # Détection des changements de poste
+    parcours['changement'] = parcours['Famille d\'emploi'].ne(parcours['Famille d\'emploi'].shift())
+    
+    # Annotations uniquement si changement (évite surcharge)
+    for _, row in parcours[parcours['changement']].iterrows():
+        ax.annotate(
+            str(row['Famille d\'emploi']),
+            (row['temps'], row['Niveau hiérarchique']),
+            textcoords="offset points",
+            xytext=(0,15),
+            ha='center',
+            fontsize=9,
+            fontweight='bold'
+        )
+    
+    # Promotions (taille des points)
+    promo = pd.to_numeric(parcours['Dernière promotion (mois)'], errors='coerce').fillna(0)
+    ax.scatter(
+        parcours['temps'],
+        parcours['Niveau hiérarchique'],
+        s=promo*3 + 30,
+        alpha=0.4
+    )
+    
+    # Mettre en évidence les changements de niveau
+    changement_niveau = parcours['Niveau hiérarchique'].diff() != 0
+    ax.scatter(
+        parcours.loc[changement_niveau, 'temps'],
+        parcours.loc[changement_niveau, 'Niveau hiérarchique'],
+        marker='D',
+        s=80,
+        label='Changement de niveau'
+    )
+    
+    # Labels
+    ax.set_title(title)
+    ax.set_xlabel("Temps (années reconstituées)")
+    ax.set_ylabel("Niveau hiérarchique")
+    
+    ax.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
+
