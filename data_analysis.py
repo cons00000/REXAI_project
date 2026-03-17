@@ -1,4 +1,5 @@
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,7 +33,7 @@ class Analyzer:
             nulls = col_data.isnull().sum()
             
             # Identify range or modalities
-            if np.issubdtype(dtype, np.number):
+            if is_numeric_dtype(col_data):
                 val_range = f"[{col_data.min()}, {col_data.max()}]"
                 modalities = "N/A (Numeric)"
             else:
@@ -124,11 +125,12 @@ class Analyzer:
             if col not in numeric_df.columns:
                 numeric_df[col] = self.df[col].astype(int)
 
-        corr_matrix = numeric_df.corr()
+        corr_matrix = self.df.corr(numeric_only=True)
 
-        # Garder uniquement les variables ayant au moins une corrélation > seuil (hors diagonale)
-        mask = (corr_matrix.abs() >= threshold)
-        np.fill_diagonal(mask.values, False)
+        mask = corr_matrix.abs() >= threshold
+        for i in range(len(mask)):
+            mask.iat[i, i] = False
+
         cols_to_keep = mask.any(axis=1)
         corr_filtered = corr_matrix.loc[cols_to_keep, cols_to_keep]
 
