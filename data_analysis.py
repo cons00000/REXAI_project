@@ -54,7 +54,10 @@ class Analyzer:
         return inventory_df
 
     def plot_distributions(self, cols=None, cols_per_row=2):
-        target_cols = cols if cols else self.df.columns
+        all_cols = cols if cols is not None else self.df.columns
+        # Skip ID columns
+        target_cols = [col for col in all_cols if "id" not in col.lower()]
+        
         n_cols = len(target_cols)
         n_rows = (n_cols + cols_per_row - 1) // cols_per_row
         
@@ -63,23 +66,25 @@ class Analyzer:
         for i, col in enumerate(target_cols, 1):
             ax = plt.subplot(n_rows, cols_per_row, i)
             
-            # 1. Handle One-Hot Encoded / Boolean / Low Cardinality
+            # 1. Boolean / Low Cardinality
             if self.df[col].dtype == 'bool' or self.df[col].nunique() == 2:
-                # FIX: Assign x to hue and set legend=False
-                sns.countplot(x=self.df[col], hue=self.df[col], palette="Blues_r", legend=False)
+                sns.countplot(x=self.df[col], hue=self.df[col], 
+                            palette=["#E74C3C", "#2ECC71"], legend=False)
                 plt.title(f"Flag: {col}")
             
-            # 2. Handle Continuous Numeric data
-            elif np.issubdtype(self.df[col].dtype, np.number):
-                sns.histplot(self.df[col], kde=True, color="teal")
+            # 2. Continuous Numeric
+            elif pd.api.types.is_numeric_dtype(self.df[col]):
+                sns.histplot(self.df[col], kde=True, color="#3498DB", edgecolor="white")
                 plt.title(f"Numeric: {col}")
             
-            # 3. Handle Categorical data
+            # 3. Categorical
             else:
                 counts = self.df[col].value_counts().iloc[:10]
-                # FIX: Assign y to hue and set legend=False
-                sns.barplot(y=counts.index, x=counts.values, hue=counts.index, palette="viridis", legend=False)
+                sns.barplot(y=counts.index, x=counts.values, hue=counts.index, 
+                            palette="Set2", legend=False)
                 plt.title(f"Categorical: {col}")
+
+            plt.xlabel("")
 
         plt.tight_layout()
         plt.show()
