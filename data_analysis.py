@@ -3,6 +3,9 @@ from pandas.api.types import is_numeric_dtype
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+
+# ---------------------------   DONNEES TABULAIRES ---------------------------
 
 class Analyzer:
     def __init__(self, data, sep=';', encoding='utf-8'):
@@ -32,21 +35,19 @@ class Analyzer:
             nunique = col_data.nunique()
             nulls = col_data.isnull().sum()
             
-            # Identify range or modalities
-            if is_numeric_dtype(col_data):
-                val_range = f"[{col_data.min()}, {col_data.max()}]"
-                modalities = "N/A (Numeric)"
+            if nunique < 10: 
+                val_range = f"Unique values: {col_data.unique().tolist()}"
+            elif is_numeric_dtype(col_data):
+                val_range = f"Range: [{col_data.min()}, {col_data.max()}]"
             else:
-                val_range = "N/A (Categorical)"
-                # Show up to 5 unique examples
-                modalities = col_data.unique()[:5].tolist()
+                val_range = f"Examples: {col_data.unique()[:3].tolist()}"
 
             inventory.append({
                 "Column": col,
                 "Type": dtype,
                 "Cardinality": nunique,
                 "Missing": nulls,
-                "Range/Examples": val_range if "Numeric" in str(val_range) else modalities
+                "Details": val_range
             })
         
         inventory_df = pd.DataFrame(inventory)
@@ -255,3 +256,19 @@ def plot_parcours(parcours, title="Parcours pro"):
     plt.tight_layout()
     plt.show()
 
+# ---------------------------   DONNEES IMAGES ---------------------------
+
+class Celeb_Faces:
+    def __init__(self, dataset_path):
+        self.path = dataset_path
+        self.data = {"attr_df" : None,
+                    "partition_df" : None,
+                    "bbox_df" : None,
+                    "landmarks_df" : None}
+        
+    def load_data(self):
+        """Charge les fichiers CSV principaux."""
+        self.data["attr_df"] = pd.read_csv(os.path.join(self.path, 'list_attr_celeba.csv'))
+        self.data["partition_df"] = pd.read_csv(os.path.join(self.path, 'list_eval_partition.csv'))
+        self.data["bbox_df"] = pd.read_csv(os.path.join(self.path, 'list_bbox_celeba.csv'))
+        self.data["landmarks_df"] = pd.read_csv(os.path.join(self.path, 'list_landmarks_align_celeba.csv'))
