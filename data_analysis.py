@@ -148,6 +148,62 @@ class Analyzer:
         plt.tight_layout()
         plt.show()
 
+    
+
+    def plot_crosstab(self, target_column, groupby=None, splitby=None):
+        if isinstance(groupby, str):
+            groupby = [groupby]
+
+        required_cols = [target_column] + groupby
+        if splitby:
+            required_cols.append(splitby)
+
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            print(f"Error: missing required columns: {missing_cols}")
+            return None
+
+        # ---- GLOBAL COLOR MAP ----
+        all_categories = sorted(self.df[groupby[0]].dropna().unique())
+        cmap = plt.get_cmap("Set3")
+        colors = {cat: cmap(i / len(all_categories)) for i, cat in enumerate(all_categories)}
+
+        # ---- SPLIT CASE ----
+        if splitby:
+            split_values = sorted(self.df[splitby].dropna().unique())
+            fig, axes = plt.subplots(1, len(split_values), figsize=(8 * len(split_values), 6), sharey=True)
+
+            if len(split_values) == 1:
+                axes = [axes]
+
+            for ax, val in zip(axes, split_values):
+                subset = self.df[self.df[splitby] == val]
+
+                crosstab = pd.crosstab(
+                    index=subset[target_column],
+                    columns=subset[groupby[0]],
+                    normalize='index'
+                )
+
+                # ensure same column order
+                crosstab = crosstab.reindex(columns=all_categories, fill_value=0)
+
+                crosstab.plot(
+                    kind='bar',
+                    stacked=True,
+                    ax=ax,
+                    color=[colors[col] for col in crosstab.columns],
+                    edgecolor='white'
+                )
+
+                ax.set_title(f"{splitby} = {val}")
+                ax.set_xlabel(target_column)
+                ax.set_ylabel("Proportion")
+                ax.legend(title=groupby[0], bbox_to_anchor=(1.02, 1), loc='upper left', frameon=False)
+
+            plt.tight_layout()
+            plt.show()
+
 class DataPreprocessor:
     def __init__(self, df):
         # We work on a copy to keep the original data intact
