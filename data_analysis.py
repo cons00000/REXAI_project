@@ -4,9 +4,9 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import matplotlib.ticker as mtick
 
 # ---------------------------   DONNEES TABULAIRES ---------------------------
-import matplotlib.ticker as mtick
 
 class Analyzer:
     def __init__(self, data, sep=';', encoding='utf-8'):
