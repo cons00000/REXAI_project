@@ -3,6 +3,7 @@ from pandas.api.types import is_numeric_dtype
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.ticker as mtick
 
 class Analyzer:
     def __init__(self, data, sep=';', encoding='utf-8'):
@@ -176,3 +177,71 @@ class DataPreprocessor:
             
             print(f"Encoding complete. New shape: {self.df.shape}")
             return self.df
+
+
+def plot_fairness_attribute(fairness_by_group, attribute, title_suffix=""):
+    """Bar charts FPR / FNR / DI par sous-groupe, un subplot-row par modèle."""
+    subset = fairness_by_group[fairness_by_group["attribute"] == attribute].copy()
+    model_names = subset["model"].unique()
+    n_models = len(model_names)
+
+    fig, axes = plt.subplots(n_models, 3, figsize=(17, 4.5 * n_models), sharey=False)
+    if n_models == 1:
+        axes = [axes]
+
+    fig.suptitle(f"FPR / FNR / Disparate Impact — {title_suffix}",
+                 fontsize=13, fontweight="bold", y=1.01)
+
+    for row_idx, model_name in enumerate(model_names):
+        m = subset[subset["model"] == model_name].sort_values("group").reset_index(drop=True)
+        groups = m["group"].astype(str).tolist()
+        x = list(range(len(groups)))
+
+        def annotate(ax, bars, values, fmt=".2%"):
+            for bar, val in zip(bars, values):
+                if pd.notna(val):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + 0.003,
+                            f"{val:{fmt}}", ha="center", va="bottom", fontsize=7.5)
+
+        ax = axes[row_idx][0]
+        bars = ax.bar(x, m["fpr"], color="#4472C4", edgecolor="white")
+        ax.axhline(m["fpr"].mean(), color="crimson", linestyle="--", lw=1.2, label="moyenne")
+        ax.set_title(f"{model_name} — FPR", fontsize=10)
+        ax.set_xticks(x); ax.set_xticklabels(groups, rotation=35, ha="right", fontsize=8)
+        ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel("False Positive Rate"); ax.legend(fontsize=8)
+        annotate(ax, bars, m["fpr"])
+
+        ax = axes[row_idx][1]
+        bars = ax.bar(x, m["fnr"], color="#ED7D31", edgecolor="white")
+        ax.axhline(m["fnr"].mean(), color="crimson", linestyle="--", lw=1.2, label="moyenne")
+        ax.set_title(f"{model_name} — FNR", fontsize=10)
+        ax.set_xticks(x); ax.set_xticklabels(groups, rotation=35, ha="right", fontsize=8)
+        ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel("False Negative Rate"); ax.legend(fontsize=8)
+        annotate(ax, bars, m["fnr"])
+
+        ax = axes[row_idx][2]
+        max_rate = m["selection_rate"].max()
+        di = (m["selection_rate"] / max_rate) if max_rate > 0 else m["selection_rate"]
+        colors = ["#C00000" if v < 0.80 else "#70AD47" for v in di.fillna(0)]
+        bars = ax.bar(x, di, color=colors, edgecolor="white")
+        ax.axhline(0.80, color="crimson", linestyle="--", lw=1.2, label="seuil 80%")
+        ax.set_title(f"{model_name} — DI (vs groupe le + prédit)", fontsize=10)
+        ax.set_xticks(x); ax.set_xticklabels(groups, rotation=35, ha="right", fontsize=8)
+        ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=0))
+        ax.set_ylabel("Disparate Impact"); ax.legend(fontsize=8)
+        annotate(ax, bars, di, fmt=".2f")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def print_fairness_table(fairness_by_group, attribute):
+    cols = ["model", "group", "n", "prevalence", "selection_rate", "fpr", "fnr"]
+    sub = (fairness_by_group[fairness_by_group["attribute"] == attribute][cols]
+           .sort_values(["model", "group"]).copy())
+    for col in ["prevalence", "selection_rate", "fpr", "fnr"]:
+        sub[col] = sub[col].map(lambda v: f"{v:.2%}" if pd.notna(v) else "—")
+    print(sub.to_string(index=False))
