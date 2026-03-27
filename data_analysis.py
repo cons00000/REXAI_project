@@ -2,6 +2,7 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 import os
 
@@ -40,7 +41,7 @@ class Analyzer:
             elif is_numeric_dtype(col_data):
                 val_range = f"Range: [{col_data.min()}, {col_data.max()}]"
             else:
-                val_range = f"Examples: {col_data.unique()[:3].tolist()}"
+                val_range = f"Examples: {col_data.unique()[:1].tolist()}"
 
             inventory.append({
                 "Column": col,
@@ -277,3 +278,73 @@ class Celeb_Faces:
         self.data["partition_df"] = pd.read_csv(os.path.join(self.path, 'list_eval_partition.csv'))
         self.data["bbox_df"] = pd.read_csv(os.path.join(self.path, 'list_bbox_celeba.csv'))
         self.data["landmarks_df"] = pd.read_csv(os.path.join(self.path, 'list_landmarks_align_celeba.csv'))
+
+def demographic_parity(df, Y, S):
+    total = df.shape[0]
+    p_y1_s1 = len(df[(df[Y]==1) & (df[S]==1)]) / total
+    p_y1_s_1 = len(df[(df[Y]==1) & (df[S]==-1)]) / total
+    
+    return p_y1_s1 - p_y1_s_1
+
+def disparate_impact(df,Y,S):
+    total = df.shape[0]
+    p_y1_s1 = len(df[(df[Y]==1) & (df[S]==1)]) / total
+    p_y1_s_1 = len(df[(df[Y]==1) & (df[S]==-1)]) / total
+    
+    if p_y1_s_1 !=0:
+        return p_y1_s1 / p_y1_s_1 
+    else : 
+        return "p_y1_s_1 vaut 0"
+    
+def plot_table_attr(df: pd.DataFrame, attrs: list, figsize=None) -> None:
+    nr, nc = df.shape
+    fig, ax = plt.subplots(figsize=figsize or (nc * 1.4, nr * 0.55 + 1))
+    ax.axis("off")
+    cmap = mpl.colormaps["YlOrRd"]
+
+    for j, a in enumerate(attrs):
+        ax.text(j+1, nr, a.replace("_"," "), ha="center", va="bottom",
+                fontsize=9, fontweight="bold", rotation=25)
+
+    for i, p in enumerate(df.index):
+        ax.text(0, nr-1-i, str(p), ha="right", va="center",
+                fontsize=10, fontweight="bold")
+        for j, a in enumerate(attrs):
+            v = df.loc[p, a]
+            bg = cmap(v / 100)
+            fg = "white" if (0.299*bg[0] + 0.587*bg[1] + 0.114*bg[2]) < 0.5 else "#1a1a1a"
+            ax.add_patch(mpl.patches.FancyBboxPatch(
+                (j+0.52, nr-1-i-0.38), 0.92, 0.76,
+                boxstyle="round,pad=0.02", linewidth=0, facecolor=bg))
+            ax.text(j+1, nr-1-i, f"{v:.0f}%", ha="center", va="center",
+                    fontsize=10, color=fg)
+
+    ax.set(xlim=(-0.3, nc+0.7), ylim=(-0.6, nr+0.8))
+    plt.tight_layout()
+    plt.show()
+
+def bias_report(df, attrs=None, threshold=0.7):
+    data = (df[attrs] if attrs else df).copy()
+    t = threshold * 100
+
+    biased = {
+        p: sorted([(a, data.at[p, a]) for a in data.columns if data.at[p, a] > t],
+                  key=lambda x: x[1], reverse=True)
+        for p in data.index
+    }
+    biased = dict(sorted(
+        {p: v for p, v in biased.items() if len(v) >= 2}.items(),
+        key=lambda x: len(x[1]), reverse=True
+    ))
+
+    if not biased:
+        print(f"Aucun persona ne cumule plusieurs attributs > {threshold:.0%}.")
+        return
+
+    print(f"── Personas biaisés (attributs > {threshold:.0%}) ──\n")
+    for persona, flagged in biased.items():
+        icon = "🔴" if len(flagged) >= 3 else "🟡"
+        print(f"{icon} {persona} ({len(flagged)} attributs forts)")
+        for attr, val in flagged:
+            print(f"   {attr:<22} {val:5.1f}%  {'█' * int(val // 10)}")
+        print()
