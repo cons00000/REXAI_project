@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from pathlib import Path
 
 # ---------------------------   DONNEES TABULAIRES ---------------------------
 
@@ -264,6 +268,7 @@ def plot_parcours(parcours, title="Parcours pro"):
 
 # ---------------------------   DONNEES IMAGES ---------------------------
 
+# Chargement des données
 class Celeb_Faces:
     def __init__(self, dataset_path):
         self.path = dataset_path
@@ -279,6 +284,7 @@ class Celeb_Faces:
         self.data["bbox_df"] = pd.read_csv(os.path.join(self.path, 'list_bbox_celeba.csv'))
         self.data["landmarks_df"] = pd.read_csv(os.path.join(self.path, 'list_landmarks_align_celeba.csv'))
 
+# Fonctions présentées dans la consigne
 def demographic_parity(df, Y, S):
     total = df.shape[0]
     p_y1_s1 = len(df[(df[Y]==1) & (df[S]==1)]) / total
@@ -296,6 +302,7 @@ def disparate_impact(df,Y,S):
     else : 
         return "p_y1_s_1 vaut 0"
     
+# Visualiser les proportions après groupement de données
 def plot_table_attr(df: pd.DataFrame, attrs: list, figsize=None) -> None:
     nr, nc = df.shape
     fig, ax = plt.subplots(figsize=figsize or (nc * 1.4, nr * 0.55 + 1))
@@ -323,6 +330,7 @@ def plot_table_attr(df: pd.DataFrame, attrs: list, figsize=None) -> None:
     plt.tight_layout()
     plt.show()
 
+# Mettre en évidence des biais
 def bias_report(df, attrs=None, threshold=0.7):
     data = (df[attrs] if attrs else df).copy()
     t = threshold * 100
@@ -348,3 +356,49 @@ def bias_report(df, attrs=None, threshold=0.7):
         for attr, val in flagged:
             print(f"   {attr:<22} {val:5.1f}%  {'█' * int(val // 10)}")
         print()
+
+# Structure pour pouvoir charger les images dans un dataloader avant de les embedder via ResNet
+class ImageDataset(Dataset):
+    def __init__(self, table: pd.DataFrame, path_image: str, transform):
+        self.records = [                                          # éviter d'utiliser iloc sur un dataframe (opération bien plus longue)
+            row for _, row in table.iterrows()
+            if os.path.exists(f"{path_image}/{row['image_id']}")
+        ]
+        self.path_image = path_image
+        self.transform  = transform
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        row  = self.records[idx]
+        path = f"{self.path_image}/{row['image_id']}"
+        img    = Image.open(path).convert("RGB")
+        tensor = self.transform(img)
+        return tensor, int(row["Smiling"])
+    
+@torch.no_grad()
+def extract_embeddings(table, path_image, backbone, transform, device,
+                       batch_size=64, num_workers=4):
+    dataset = ImageDataset(table, path_image, transform)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                         num_workers=num_workers, pin_memory=(device == "cuda"))
+
+    all_embs, all_targets = [], []
+    for tensors, targets in loader:
+        all_embs.append(backbone(tensors.to(device)).cpu().numpy())
+        all_targets.extend(targets.numpy())
+
+    return np.vstack(all_embs), np.array(all_targets)
+
+def load_or_compute_embeddings(table, path_image, backbone, transform, device,
+                                cache_path="cache/embeddings.npz", **kwargs):
+    if Path(cache_path).exists():
+        data = np.load(cache_path)
+        return data["X"], data["y"]
+
+    X, y = extract_embeddings(table, path_image, backbone, transform, device, **kwargs)
+
+    Path(cache_path).parent.mkdir(exist_ok=True)
+    np.savez_compressed(cache_path, X=X, y=y)
+    return X, y
