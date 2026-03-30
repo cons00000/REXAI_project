@@ -1,5 +1,6 @@
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
+from sklearn.metrics import accuracy_score, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -9,6 +10,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
+from scipy.special import expit  
 
 # ---------------------------   DONNEES TABULAIRES ---------------------------
 
@@ -402,3 +404,69 @@ def load_or_compute_embeddings(table, path_image, backbone, transform, device,
     Path(cache_path).parent.mkdir(exist_ok=True)
     np.savez_compressed(cache_path, X=X, y=y)
     return X, y
+
+def fairness_report(model, X_test, y_true, sensitive_df):
+    """
+    model        : tout objet avec une méthode .predict()
+    X_test       : features de test
+    y_true       : array-like des vrais labels (-1/1)
+    sensitive_df : DataFrame dont chaque colonne est un attribut sensible (-1/1)
+    """
+    y_pred = model.predict(X_test)
+    y_true = np.array(y_true)
+    rows = []
+
+    for attr in sensitive_df.columns:
+        attr_vals = np.array(sensitive_df[attr])
+        metrics = {}
+
+        for val in [-1, 1]:
+            mask = attr_vals == val
+            yt, yp = y_true[mask], y_pred[mask]
+            tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[-1, 1]).ravel()
+            metrics[val] = {
+                "Group":    f"{attr}={'+' if val == 1 else ''}{val}",
+                "N":        int(mask.sum()),
+                "Accuracy": accuracy_score(yt, yp),
+                "FPR":      fp / (fp + tn) if (fp + tn) else np.nan,
+                "FNR":      fn / (fn + tp) if (fn + tp) else np.nan,
+            }
+
+        for val in [-1, 1]:
+            other = metrics[-val]
+            metrics[val]["Delta_Acc"] = abs(metrics[val]["Accuracy"] - other["Accuracy"])
+            metrics[val]["Delta_FPR"] = abs(metrics[val]["FPR"]      - other["FPR"])
+            metrics[val]["Delta_FNR"] = abs(metrics[val]["FNR"]      - other["FNR"])
+            rows.append(metrics[val])
+
+    return pd.DataFrame(rows).set_index("Group").round(3)
+
+def predict(images_np, backbone, model, transform, device):
+    """
+    images_np : np.array (N, H, W, C)
+    backbone : PyTorch model
+    model    : sklearn pipeline/classifier
+    """
+    backbone.eval()  
+
+    imgs = [transform(Image.fromarray(img.astype("uint8")).convert("RGB")) for img in images_np]
+    batch = torch.stack(imgs).to(device)
+
+    with torch.no_grad():
+        embeddings = backbone(batch).cpu().numpy()  
+
+    outputs = model.predict(embeddings) 
+
+    return outputs
+
+def predict_lime(images_np, backbone, pipe, transform, device): # on simule une fonction de prédiction pour LIME qui retourne des probabilités
+    backbone.eval()
+    imgs = [transform(Image.fromarray(img.astype("uint8")).convert("RGB")) for img in images_np]
+    batch = torch.stack(imgs).to(device)
+    
+    with torch.no_grad():
+        embeddings = backbone(batch).cpu().numpy()
+    
+    scores = pipe.decision_function(embeddings)  # shape (N,)
+    probs = np.vstack([1 - expit(scores), expit(scores)]).T  # shape (N,2)
+    return probs
