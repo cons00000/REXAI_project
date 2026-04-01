@@ -1,3 +1,6 @@
+import copy
+from dataclasses import dataclass
+
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.metrics import accuracy_score, confusion_matrix
@@ -6,11 +9,19 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import os
+import shap
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
 from scipy.special import expit  
+from torch import nn
+import torchvision.transforms as T
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+from xplique.attributions import Lime, KernelShap
 
 # ---------------------------   DONNEES TABULAIRES ---------------------------
 
@@ -104,7 +115,6 @@ class Analyzer:
             print(f"Error: {target_column} not found.")
             return
 
-        # Calculate correlations
         bool_cols = self.df.select_dtypes(include=[bool]).columns
         numeric_df = self.df.select_dtypes(include=[np.number]).copy()
 
@@ -112,10 +122,18 @@ class Analyzer:
             if col not in numeric_df.columns:
                 numeric_df[col] = self.df[col].astype(int)
 
+        if target_column not in numeric_df.columns:
+            print(f"Error: {target_column} must be numeric or boolean.")
+            return
+
         correlations = numeric_df.corr()[target_column].sort_values(ascending=False)
         
         # Remove the target's correlation with itself
-        correlations = correlations.drop(target_column)
+        correlations = correlations.drop(target_column, errors="ignore")
+
+        if correlations.empty:
+            print(f"No numeric correlations available for {target_column}.")
+            return correlations
 
         plt.figure(figsize=(10, 6))
         sns.barplot(x=correlations.values, y=correlations.index, hue=correlations.index, palette="RdBu_r", legend=False)
@@ -138,7 +156,7 @@ class Analyzer:
             if col not in numeric_df.columns:
                 numeric_df[col] = self.df[col].astype(int)
 
-        corr_matrix = self.df.corr(numeric_only=True)
+        corr_matrix = numeric_df.corr()
 
         mask = corr_matrix.abs() >= threshold
         for i in range(len(mask)):
@@ -146,6 +164,10 @@ class Analyzer:
 
         cols_to_keep = mask.any(axis=1)
         corr_filtered = corr_matrix.loc[cols_to_keep, cols_to_keep]
+
+        if corr_filtered.empty:
+            print(f"No numeric/boolean correlations found above the threshold {threshold}.")
+            return corr_filtered
 
         size = max(10, len(corr_filtered) * 0.6)
         plt.figure(figsize=(size, size * 0.85))
@@ -189,6 +211,54 @@ class DataPreprocessor:
             
             print(f"Encoding complete. New shape: {self.df.shape}")
             return self.df
+
+def _coerce_binary_series(series, column_name):
+    """
+    Converts binary columns encoded as 0/1, -1/1, bool or numeric strings to 0/1.
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    invalid_mask = series.notna() & numeric.isna()
+    if invalid_mask.any():
+        invalid_values = series[invalid_mask].astype(str).unique()[:5].tolist()
+        raise ValueError(
+            f"Column '{column_name}' must be binary. Invalid values found: {invalid_values}"
+        )
+
+    unique_values = set(pd.unique(numeric.dropna()))
+    if not unique_values:
+        return numeric.astype(float)
+    if unique_values <= {0.0, 1.0}:
+        return numeric.astype(float)
+    if unique_values <= {-1.0, 1.0}:
+        return numeric.map({-1.0: 0.0, 1.0: 1.0}).astype(float)
+
+    preview = sorted(unique_values)[:5]
+    raise ValueError(
+        f"Column '{column_name}' must be binary and encoded as 0/1 or -1/1. "
+        f"Found values like {preview}."
+    )
+
+def _positive_rates_by_group(df, target_column, sensitive_column):
+    if target_column not in df.columns or sensitive_column not in df.columns:
+        raise KeyError(f"Columns '{target_column}' and/or '{sensitive_column}' are missing.")
+
+    prepared = pd.DataFrame({
+        "target": _coerce_binary_series(df[target_column], target_column),
+        "sensitive": _coerce_binary_series(df[sensitive_column], sensitive_column),
+    }).dropna()
+
+    if prepared.empty:
+        raise ValueError("No valid rows available after binary coercion.")
+
+    group_1 = prepared.loc[prepared["sensitive"] == 1.0, "target"]
+    group_0 = prepared.loc[prepared["sensitive"] == 0.0, "target"]
+
+    if group_1.empty or group_0.empty:
+        raise ValueError(
+            f"Sensitive column '{sensitive_column}' must contain both groups after coercion."
+        )
+
+    return group_1.mean(), group_0.mean()
 
 def get_parcours(df, matricule):
     """
@@ -286,23 +356,35 @@ class Celeb_Faces:
         self.data["bbox_df"] = pd.read_csv(os.path.join(self.path, 'list_bbox_celeba.csv'))
         self.data["landmarks_df"] = pd.read_csv(os.path.join(self.path, 'list_landmarks_align_celeba.csv'))
 
+def resolve_celeba_image_dir(dataset_path):
+    """
+    Resolves the actual directory containing the CelebA image files.
+    """
+    dataset_path = Path(dataset_path)
+    candidates = [
+        dataset_path,
+        dataset_path / "img_align_celeba",
+        dataset_path / "img_align_celeba" / "img_align_celeba",
+    ]
+
+    for candidate in candidates:
+        if candidate.is_dir() and next(candidate.glob("*.jpg"), None) is not None:
+            return str(candidate)
+
+    raise FileNotFoundError(
+        f"Could not find the CelebA image directory from '{dataset_path}'."
+    )
+
 # Fonctions présentées dans la consigne
 def demographic_parity(df, Y, S):
-    total = df.shape[0]
-    p_y1_s1 = len(df[(df[Y]==1) & (df[S]==1)]) / total
-    p_y1_s_1 = len(df[(df[Y]==1) & (df[S]==-1)]) / total
-    
-    return p_y1_s1 - p_y1_s_1
+    p_y1_given_s1, p_y1_given_s0 = _positive_rates_by_group(df, Y, S)
+    return p_y1_given_s1 - p_y1_given_s0
 
 def disparate_impact(df,Y,S):
-    total = df.shape[0]
-    p_y1_s1 = len(df[(df[Y]==1) & (df[S]==1)]) / total
-    p_y1_s_1 = len(df[(df[Y]==1) & (df[S]==-1)]) / total
-    
-    if p_y1_s_1 !=0:
-        return p_y1_s1 / p_y1_s_1 
-    else : 
-        return "p_y1_s_1 vaut 0"
+    p_y1_given_s1, p_y1_given_s0 = _positive_rates_by_group(df, Y, S)
+    if p_y1_given_s0 != 0:
+        return p_y1_given_s1 / p_y1_given_s0
+    return np.nan
     
 # Visualiser les proportions après groupement de données
 def plot_table_attr(df: pd.DataFrame, attrs: list, figsize=None) -> None:
@@ -360,113 +442,534 @@ def bias_report(df, attrs=None, threshold=0.7):
         print()
 
 # Structure pour pouvoir charger les images dans un dataloader avant de les embedder via ResNet
-class ImageDataset(Dataset):
-    def __init__(self, table: pd.DataFrame, path_image: str, transform):
-        self.records = [                                          # éviter d'utiliser iloc sur un dataframe (opération bien plus longue)
-            row for _, row in table.iterrows()
-            if os.path.exists(f"{path_image}/{row['image_id']}")
+class CelebADataset(Dataset):
+    def __init__(self, image_ids: pd.Series, labels: pd.Series,
+                 path_image: str = None, transform=None):
+        self.records = [
+            (img_id, label)
+            for img_id, label in zip(image_ids, labels)
+            if path_image is None or os.path.exists(os.path.join(path_image, img_id))
         ]
         self.path_image = path_image
         self.transform  = transform
+        self.features   = None                                 # None = mode image
+
+    def load_features(self, X: np.ndarray):
+        """Bascule en mode feature : plus besoin des images."""
+        assert len(X) == len(self.records), "Taille incompatible"
+        self.features = torch.from_numpy(X).float()
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        row  = self.records[idx]
-        path = f"{self.path_image}/{row['image_id']}"
-        img    = Image.open(path).convert("RGB")
-        tensor = self.transform(img)
-        return tensor, int(row["Smiling"])
-    
+        img_id, label = self.records[idx]
+        label = 1 if int(label) == 1 else 0
+
+        if self.features is not None:                          # mode feature
+            return self.features[idx], int(label)
+
+        img = Image.open(os.path.join(self.path_image, img_id)).convert("RGB")
+        return self.transform(img), int(label), img_id
+
+def _unpack_batch(batch):
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        raise ValueError("Expected a batch shaped as (inputs, labels) or (inputs, labels, ...).")
+    return batch[0], batch[1], batch[2:]
+
 @torch.no_grad()
-def extract_embeddings(table, path_image, backbone, transform, device,
-                       batch_size=64, num_workers=4):
-    dataset = ImageDataset(table, path_image, transform)
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                         num_workers=num_workers, pin_memory=(device == "cuda"))
-
+def extract_embeddings(loader, backbone, device):
     all_embs, all_targets = [], []
-    for tensors, targets in loader:
+    for batch in loader:
+        tensors, targets, _ = _unpack_batch(batch)
         all_embs.append(backbone(tensors.to(device)).cpu().numpy())
-        all_targets.extend(targets.numpy())
+        all_targets.append(targets.numpy())
+    return np.vstack(all_embs), np.concatenate(all_targets)
 
-    return np.vstack(all_embs), np.array(all_targets)
+def load_or_compute_embeddings(dataset, backbone, device,
+                                cache_path, batch_size=64, num_workers=4):
+    current_image_ids = np.array([img_id for img_id, _ in dataset.records], dtype=str)
+    current_labels = np.array(
+        [1 if int(label) == 1 else 0 for _, label in dataset.records],
+        dtype=np.int8,
+    )
 
-def load_or_compute_embeddings(table, path_image, backbone, transform, device,
-                                cache_path="cache/embeddings.npz", **kwargs):
     if Path(cache_path).exists():
-        data = np.load(cache_path)
-        return data["X"], data["y"]
+        data = np.load(cache_path, allow_pickle=False)
+        if {"X", "y", "image_ids", "labels"}.issubset(data.files):
+            if (
+                np.array_equal(data["image_ids"], current_image_ids)
+                and np.array_equal(data["labels"], current_labels)
+            ):
+                return data["X"], data["y"]
 
-    X, y = extract_embeddings(table, path_image, backbone, transform, device, **kwargs)
+    loader = DataLoader(dataset, batch_size=batch_size,
+                        shuffle=False, num_workers=num_workers,
+                        pin_memory=(device == "cuda"))
+    X, y = extract_embeddings(loader, backbone, device)
 
-    Path(cache_path).parent.mkdir(exist_ok=True)
-    np.savez_compressed(cache_path, X=X, y=y)
+    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        X=X,
+        y=y,
+        image_ids=current_image_ids,
+        labels=current_labels,
+    )
     return X, y
 
-def fairness_report(model, X_test, y_true, sensitive_df):
+def run_epoch(head, criterion, optimizer,loader, device, train=True):
+    head.train(train)
+    total_loss, correct, n = 0.0, 0, 0
+
+    with torch.set_grad_enabled(train):
+        for batch in loader:
+            features, labels, _ = _unpack_batch(batch)
+            features = features.to(device)
+            labels   = labels.float().unsqueeze(1).to(device)
+
+            logits = head(features)
+            loss   = criterion(logits, labels)
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * len(features)
+            correct    += ((logits.sigmoid() > 0.5) == labels.bool()).sum().item()
+            n          += len(features)
+
+    return total_loss / n, correct / n
+
+class FullModel2Class(nn.Module):
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone = backbone.eval()
+        self.head = head.eval()
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        
+        logit = self.head(features) 
+        
+        prob1 = torch.sigmoid(logit)          
+        prob0 = 1 - prob1                     
+        return torch.cat([prob0, prob1], dim=1)
+
+class FullModelLogits2Class(nn.Module):
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone = backbone.eval()
+        self.head = head.eval()
+
+    def forward(self, x):
+        features = self.backbone(x)
+        logit = self.head(features)
+        return torch.cat([-logit, logit], dim=1)
+
+def fairness_report_dataloader_streaming_imgid(model, dataloader, sensitive_df, threshold=0.5, device="cpu", img_id_col="img_id"):
     """
-    model        : tout objet avec une méthode .predict()
-    X_test       : features de test
-    y_true       : array-like des vrais labels (-1/1)
-    sensitive_df : DataFrame dont chaque colonne est un attribut sensible (-1/1)
+    Fairness report streaming avec DataLoader qui renvoie img_id.
+
+    model        : FullModel2Class (renvoie [prob0, prob1])
+    dataloader   : DataLoader renvoyant (X_batch, y_batch, img_id_batch)
+    sensitive_df : DataFrame avec les attributs sensibles + colonne img_id_col
+    threshold    : Seuil pour convertir probabilités en labels
+    img_id_col   : nom de la colonne contenant les img_id dans sensitive_df
     """
-    y_pred = model.predict(X_test)
-    y_true = np.array(y_true)
+    model.eval()
+    model = model.to(device)
+
+    if img_id_col not in sensitive_df.columns:
+        raise KeyError(f"Column '{img_id_col}' is missing from sensitive_df.")
+
+    sensitive_cols = [col for col in sensitive_df.columns if col != img_id_col]
+    prepared_sensitive = sensitive_df[[img_id_col]].copy()
+    for attr in sensitive_cols:
+        prepared_sensitive[attr] = _coerce_binary_series(sensitive_df[attr], attr)
+
+    # Création du mapping img_id -> ligne pour accès rapide aux attributs sensibles
+    imgid_to_row = prepared_sensitive.set_index(img_id_col).to_dict(orient='index')
+
+    # Initialisation des compteurs pour chaque attribut et valeur
+    group_stats = {
+        attr: {val: {"TN":0, "FP":0, "FN":0, "TP":0, "N":0} for val in [0,1]}
+        for attr in sensitive_cols
+    }
+
+    with torch.no_grad():
+        for batch in dataloader:
+            X_batch, y_batch, extras = _unpack_batch(batch)
+            if not extras:
+                raise ValueError("DataLoader doit renvoyer (X, y, img_id)")
+            img_ids_batch = extras[0]
+
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.cpu().numpy()
+            img_ids_batch = list(img_ids_batch) if isinstance(img_ids_batch, torch.Tensor) else img_ids_batch
+
+            # Prédictions
+            probs = model(X_batch)
+            y_pred_batch = (probs[:,1] >= threshold).cpu().numpy().astype(int)
+
+            valid_positions = [
+                idx for idx, img_id in enumerate(img_ids_batch)
+                if img_id in imgid_to_row
+            ]
+            if not valid_positions:
+                continue
+
+            y_true_valid = y_batch[valid_positions]
+            y_pred_valid = y_pred_batch[valid_positions]
+            rows_valid = [imgid_to_row[img_ids_batch[idx]] for idx in valid_positions]
+
+            # Mise à jour des compteurs pour chaque attribut sensible
+            for attr, stats in group_stats.items():
+                attr_vals = np.array([row[attr] for row in rows_valid], dtype=float)
+                for val in [0,1]:
+                    mask = (attr_vals == float(val))
+                    if mask.sum() == 0:
+                        continue
+
+                    yt, yp = y_true_valid[mask], y_pred_valid[mask]
+                    tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0,1]).ravel()
+
+                    stats[val]["TN"] += tn
+                    stats[val]["FP"] += fp
+                    stats[val]["FN"] += fn
+                    stats[val]["TP"] += tp
+                    stats[val]["N"] += mask.sum()
+
+    # Calcul des métriques finales
     rows = []
+    for attr, stats in group_stats.items():
+        for val in [0,1]:
+            m = stats[val]
+            o = stats[1-val]
 
-    for attr in sensitive_df.columns:
-        attr_vals = np.array(sensitive_df[attr])
-        metrics = {}
+            def safe_div(a, b):
+                return a/b if b > 0 else np.nan
 
-        for val in [-1, 1]:
-            mask = attr_vals == val
-            yt, yp = y_true[mask], y_pred[mask]
-            tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[-1, 1]).ravel()
-            metrics[val] = {
-                "Group":    f"{attr}={'+' if val == 1 else ''}{val}",
-                "N":        int(mask.sum()),
-                "Accuracy": accuracy_score(yt, yp),
-                "FPR":      fp / (fp + tn) if (fp + tn) else np.nan,
-                "FNR":      fn / (fn + tp) if (fn + tp) else np.nan,
-            }
+            acc = safe_div(m["TP"] + m["TN"], m["N"])
+            fpr = safe_div(m["FP"], m["FP"] + m["TN"])
+            fnr = safe_div(m["FN"], m["FN"] + m["TP"])
 
-        for val in [-1, 1]:
-            other = metrics[-val]
-            metrics[val]["Delta_Acc"] = abs(metrics[val]["Accuracy"] - other["Accuracy"])
-            metrics[val]["Delta_FPR"] = abs(metrics[val]["FPR"]      - other["FPR"])
-            metrics[val]["Delta_FNR"] = abs(metrics[val]["FNR"]      - other["FNR"])
-            rows.append(metrics[val])
+            o_acc = safe_div(o["TP"] + o["TN"], o["N"])
+            o_fpr = safe_div(o["FP"], o["FP"] + o["TN"])
+            o_fnr = safe_div(o["FN"], o["FN"] + o["TP"])
+
+            rows.append({
+                "Group": f"{attr}={val}",
+                "N": m["N"],
+                "Accuracy": acc,
+                "FPR": fpr,
+                "FNR": fnr,
+                "Δ_Acc": abs(acc - o_acc) if pd.notna(acc) and pd.notna(o_acc) else np.nan,
+                "Δ_FPR": abs(fpr - o_fpr) if pd.notna(fpr) and pd.notna(o_fpr) else np.nan,
+                "Δ_FNR": abs(fnr - o_fnr) if pd.notna(fnr) and pd.notna(o_fnr) else np.nan,
+            })
 
     return pd.DataFrame(rows).set_index("Group").round(3)
 
-def predict(images_np, backbone, model, transform, device):
+@dataclass
+class ImageExplanationContext:
+    explain_model: nn.Module
+    head_model: nn.Module
+    gradcam_model: nn.Module
+    cam_extractor: GradCAM
+    explain_device: str
+    path_image: str
+    label_names: list
+    display_transform: object
+    mean: np.ndarray
+    std: np.ndarray
+    mean_t: torch.Tensor
+    std_t: torch.Tensor
+    shap_explainer: object = None
+
+def prepare_image_explanation_context(
+    backbone,
+    head,
+    device,
+    path_image,
+    label_names=None,
+    image_size=224,
+):
     """
-    images_np : np.array (N, H, W, C)
-    backbone : PyTorch model
-    model    : sklearn pipeline/classifier
+    Prepares the models and transforms needed for Grad-CAM and SHAP explanations.
     """
-    backbone.eval()  
+    label_names = label_names or ["Not Smiling", "Smiling"]
+    path_image = str(path_image)
 
-    imgs = [transform(Image.fromarray(img.astype("uint8")).convert("RGB")) for img in images_np]
-    batch = torch.stack(imgs).to(device)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    mean_t = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
+    display_transform = T.Compose([T.Resize(256), T.CenterCrop(image_size)])
 
+    if device == "mps":
+        explain_device = "cpu"
+        backbone_explain = copy.deepcopy(backbone).to(explain_device).eval()
+        head_explain = copy.deepcopy(head).to(explain_device).eval()
+    else:
+        explain_device = device
+        backbone_explain = backbone
+        head_explain = head
+
+    explain_model = FullModel2Class(backbone_explain, head_explain).to(explain_device).eval()
+    gradcam_model = FullModelLogits2Class(backbone_explain, head_explain).to(explain_device).eval()
+    cam_extractor = GradCAM(model=gradcam_model, target_layers=[gradcam_model.backbone.layer4[-1]])
+
+    return ImageExplanationContext(
+        explain_model=explain_model,
+        head_model=head_explain,
+        gradcam_model=gradcam_model,
+        cam_extractor=cam_extractor,
+        explain_device=explain_device,
+        path_image=path_image,
+        label_names=label_names,
+        display_transform=display_transform,
+        mean=mean,
+        std=std,
+        mean_t=mean_t,
+        std_t=std_t,
+    )
+
+def load_explanation_image(context, image_id):
+    """
+    Loads an image twice: as displayable RGB and as a normalized tensor for the model.
+    """
+    pil_image = Image.open(os.path.join(context.path_image, image_id)).convert("RGB")
+    display_img = np.asarray(context.display_transform(pil_image), dtype=np.float32) / 255.0
+    input_tensor = torch.from_numpy(display_img.transpose(2, 0, 1)).unsqueeze(0)
+    input_tensor = (input_tensor - context.mean_t) / context.std_t
+    return display_img, input_tensor
+
+def predict_proba_from_rgb(context, batch_rgb):
+    """
+    Applies the smiling classifier on RGB images in [0, 1] with shape (N, H, W, C).
+    """
+    batch_rgb = np.asarray(batch_rgb, dtype=np.float32)
+    batch_tensor = torch.from_numpy(batch_rgb.transpose(0, 3, 1, 2))
+    batch_tensor = (batch_tensor - context.mean_t) / context.std_t
     with torch.no_grad():
-        embeddings = backbone(batch).cpu().numpy()  
-
-    outputs = model.predict(embeddings) 
-
-    return outputs
-
-def predict_lime(images_np, backbone, pipe, transform, device): # on simule une fonction de prédiction pour LIME qui retourne des probabilités
-    backbone.eval()
-    imgs = [transform(Image.fromarray(img.astype("uint8")).convert("RGB")) for img in images_np]
-    batch = torch.stack(imgs).to(device)
-    
-    with torch.no_grad():
-        embeddings = backbone(batch).cpu().numpy()
-    
-    scores = pipe.decision_function(embeddings)  # shape (N,)
-    probs = np.vstack([1 - expit(scores), expit(scores)]).T  # shape (N,2)
+        probs = context.explain_model(batch_tensor.to(context.explain_device)).cpu().numpy()
     return probs
+
+def collect_feature_predictions(
+    context,
+    feature_dataset,
+    sensitive_df,
+    sensitive_attrs,
+    batch_size=256,
+    threshold=0.5,
+    img_id_col="image_id",
+):
+    """
+    Collects predictions quickly from a dataset already loaded with cached embeddings.
+    """
+    if feature_dataset.features is None:
+        raise ValueError("feature_dataset must already contain cached embeddings via load_features().")
+    if img_id_col not in sensitive_df.columns:
+        raise KeyError(f"Column '{img_id_col}' is missing from sensitive_df.")
+
+    prepared_sensitive = sensitive_df[[img_id_col]].copy()
+    for attr in sensitive_attrs:
+        prepared_sensitive[attr] = _coerce_binary_series(sensitive_df[attr], attr)
+    sensitive_lookup = prepared_sensitive.set_index(img_id_col)
+
+    loader = DataLoader(feature_dataset, batch_size=batch_size, shuffle=False)
+    rows = []
+    offset = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            features, labels, _ = _unpack_batch(batch)
+            logits = context.head_model(features.to(context.explain_device))
+            prob_smiling = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+            preds = (prob_smiling >= threshold).astype(int)
+            labels_np = labels.numpy()
+
+            img_ids_batch = [
+                img_id for img_id, _ in feature_dataset.records[offset:offset + len(labels_np)]
+            ]
+            offset += len(labels_np)
+
+            for img_id, y_true, y_pred, proba in zip(img_ids_batch, labels_np, preds, prob_smiling):
+                row = {
+                    img_id_col: img_id,
+                    "y_true": int(y_true),
+                    "y_pred": int(y_pred),
+                    "prob_smiling": float(proba),
+                    "correct": bool(int(y_true) == int(y_pred)),
+                }
+                if img_id in sensitive_lookup.index:
+                    for attr in sensitive_attrs:
+                        value = sensitive_lookup.at[img_id, attr]
+                        if pd.notna(value):
+                            row[attr] = int(value)
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+def prepare_image_explanation_cases(
+    context,
+    feature_dataset,
+    sensitive_df,
+    sensitive_attrs,
+    batch_size=256,
+    threshold=0.5,
+    img_id_col="image_id",
+):
+    """
+    Builds a compact explanation payload: predictions, group counts, chosen cases and summary.
+    """
+    predictions = collect_feature_predictions(
+        context=context,
+        feature_dataset=feature_dataset,
+        sensitive_df=sensitive_df,
+        sensitive_attrs=sensitive_attrs,
+        batch_size=batch_size,
+        threshold=threshold,
+        img_id_col=img_id_col,
+    )
+
+    if predictions.empty:
+        raise ValueError("No predictions available to prepare explanation cases.")
+
+    group_counts = pd.concat([
+        predictions[attr]
+        .value_counts()
+        .rename_axis("value")
+        .reset_index(name="count")
+        .assign(attribute=attr)
+        for attr in sensitive_attrs
+    ], ignore_index=True).sort_values(["count", "attribute", "value"]).reset_index(drop=True)
+
+    if group_counts.empty:
+        raise ValueError("No sensitive-group counts available for explanation case selection.")
+
+    minority_attr = group_counts.loc[0, "attribute"]
+    minority_value = int(group_counts.loc[0, "value"])
+    minority_count = int(group_counts.loc[0, "count"])
+
+    correct_candidates = predictions[predictions["correct"]]
+    if correct_candidates.empty:
+        raise ValueError("No correct prediction available for explanation.")
+    correct_case = correct_candidates.iloc[0]
+
+    used_ids = {correct_case[img_id_col]}
+    incorrect_candidates = predictions[
+        (~predictions["correct"]) & (~predictions[img_id_col].isin(used_ids))
+    ]
+    if incorrect_candidates.empty:
+        incorrect_candidates = predictions[~predictions["correct"]]
+    if incorrect_candidates.empty:
+        raise ValueError("No incorrect prediction available for explanation.")
+    incorrect_case = incorrect_candidates.iloc[0]
+
+    used_ids.add(incorrect_case[img_id_col])
+    minority_pool = predictions[predictions[minority_attr] == minority_value]
+    if minority_pool.empty:
+        raise ValueError(f"No sample found for minority group {minority_attr}={minority_value}.")
+    minority_candidates = minority_pool[~minority_pool[img_id_col].isin(used_ids)]
+    if minority_candidates.empty:
+        minority_candidates = minority_pool
+    minority_case = minority_candidates.iloc[0]
+
+    cases = {
+        "correct": correct_case,
+        "incorrect": incorrect_case,
+        "minority": minority_case,
+    }
+
+    case_summary = pd.DataFrame({
+        name: {
+            "image_id": row[img_id_col],
+            "y_true": row["y_true"],
+            "y_pred": row["y_pred"],
+            "prob_smiling": round(row["prob_smiling"], 3),
+            "correct": row["correct"],
+        }
+        for name, row in cases.items()
+    }).T
+    case_summary.loc["minority", "minority_group"] = (
+        f"{minority_attr}={minority_value} (n={minority_count})"
+    )
+
+    return {
+        "predictions": predictions,
+        "group_counts": group_counts,
+        "minority_attr": minority_attr,
+        "minority_value": minority_value,
+        "minority_count": minority_count,
+        "cases": cases,
+        "case_summary": case_summary,
+    }
+
+def show_gradcam_explanations(context, cases, target_class=1):
+    """
+    Displays Grad-CAM visualizations for a dictionary of named cases.
+    """
+    for case_name, row in cases.items():
+        image_id = row["image_id"]
+        display_img, input_tensor = load_explanation_image(context, image_id)
+        grayscale_cam = context.cam_extractor(
+            input_tensor=input_tensor.to(context.explain_device),
+            targets=[ClassifierOutputTarget(target_class)],
+        )[0]
+        cam_overlay = show_cam_on_image(display_img, grayscale_cam, use_rgb=True)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(display_img)
+        axes[0].set_title(
+            f"{case_name}\ntrue={row['y_true']} | pred={row['y_pred']} | p={row['prob_smiling']:.3f}"
+        )
+        axes[1].imshow(cam_overlay)
+        axes[1].set_title(f"Grad-CAM sur la classe {context.label_names[target_class]}")
+        for ax in axes:
+            ax.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+def _get_shap_explainer(context, blur="blur(32,32)"):
+    if context.shap_explainer is None:
+        context.shap_explainer = shap.Explainer(
+            lambda batch_rgb: predict_proba_from_rgb(context, batch_rgb),
+            shap.maskers.Image(blur, (224, 224, 3)),
+            output_names=context.label_names,
+        )
+    return context.shap_explainer
+
+def show_shap_explanations(
+    context,
+    cases,
+    max_evals=300,
+    batch_size=16,
+    output_index=1,
+    blur="blur(32,32)",
+):
+    """
+    Displays SHAP image explanations for a dictionary of named cases.
+    """
+    shap_explainer = _get_shap_explainer(context, blur=blur)
+
+    for case_name, row in cases.items():
+        image_id = row["image_id"]
+        display_img, _ = load_explanation_image(context, image_id)
+        batch_rgb = display_img[None, ...]
+        shap_values = shap_explainer(
+            batch_rgb,
+            outputs=[output_index],
+            max_evals=max_evals,
+            batch_size=batch_size,
+        )
+        print(
+            f"{case_name}: {image_id} | true={row['y_true']} | pred={row['y_pred']} | p={row['prob_smiling']:.3f}"
+        )
+        shap.image_plot(
+            shap_values,
+            pixel_values=batch_rgb,
+            labels=np.array([[f"{case_name} | {context.label_names[output_index]}"]]),
+        )
