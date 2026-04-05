@@ -178,7 +178,6 @@ class Analyzer:
 
 class DataPreprocessor:
     def __init__(self, df):
-        # We work on a copy to keep the original data intact
         self.df = df.copy()
         self.original_columns = df.columns.tolist()
 
@@ -375,7 +374,6 @@ def resolve_celeba_image_dir(dataset_path):
         f"Could not find the CelebA image directory from '{dataset_path}'."
     )
 
-# Fonctions présentées dans la consigne
 def demographic_parity(df, Y, S):
     p_y1_given_s1, p_y1_given_s0 = _positive_rates_by_group(df, Y, S)
     return p_y1_given_s1 - p_y1_given_s0
@@ -386,7 +384,6 @@ def disparate_impact(df,Y,S):
         return p_y1_given_s1 / p_y1_given_s0
     return np.nan
     
-# Visualiser les proportions après groupement de données
 def plot_table_attr(df: pd.DataFrame, attrs: list, figsize=None) -> None:
     nr, nc = df.shape
     fig, ax = plt.subplots(figsize=figsize or (nc * 1.4, nr * 0.55 + 1))
@@ -466,7 +463,7 @@ class CelebADataset(Dataset):
         img_id, label = self.records[idx]
         label = 1 if int(label) == 1 else 0
 
-        if self.features is not None:                          # mode feature
+        if self.features is not None:                          
             return self.features[idx], int(label)
 
         img = Image.open(os.path.join(self.path_image, img_id)).convert("RGB")
