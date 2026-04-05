@@ -5,5 +5,8 @@ __pycache__/
 .DS_Store
 .env
 venv/
-.pkl
-.npz
+*.pkl
+*.npz
+*.csv
+old/
+cache/
